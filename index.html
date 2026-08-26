@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<title>しずかカメラ</title>
+<meta name="description" content="シャッター音が鳴らず、聴いている音楽も止めないカメラ。止まるかどうかをその場で確かめられます。">
+<meta name="theme-color" content="#000000">
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="しずかカメラ">
+<link rel="apple-touch-icon" href="icons/icon-180.png">
+<link rel="icon" href="icons/icon-192.png">
+<style>
+  :root{
+    --ink:#f2f2f4; --ink-2:#b9b9c0; --muted:#8a8a93;
+    --line:rgba(255,255,255,.13); --surface:#191920; --surface-2:#23232c;
+    --accent:#ffd400; --ok:#3ddc84; --ng:#ff6b6b;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    margin:0; background:#000; color:var(--ink); overflow:hidden; overscroll-behavior:none;
+    font-family:-apple-system,BlinkMacSystemFont,"Hiragino Sans","Noto Sans JP",sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  silent-camera{position:fixed; inset:0; height:100%}
+
+  /* ---- 起動オーバーレイ ---- */
+  #boot{position:fixed; inset:0; display:grid; place-items:center; background:#000; z-index:100}
+  #boot.gone{display:none}
+  #boot .c{text-align:center; max-width:400px; padding:24px; line-height:1.9}
+  #boot h1{font-size:21px; margin:0 0 10px}
+  #boot p{font-size:13.5px; color:var(--muted); margin:0}
+
+  /* ---- 音チェックを開くボタン ---- */
+  .fab{
+    position:fixed; z-index:40;
+    /* カメラ自身の表示（無音バッジ・解像度）が上の段にいるので、その下に置く */
+    top:calc(48px + env(safe-area-inset-top)); left:calc(10px + env(safe-area-inset-left));
+    display:flex; align-items:center; gap:6px;
+    background:rgba(0,0,0,.55); backdrop-filter:blur(8px); -webkit-backdrop-filter:blur(8px);
+    border:1px solid var(--line); color:var(--ink); border-radius:999px;
+    padding:8px 13px; font-size:12.5px; font-weight:700; cursor:pointer;
+  }
+  .fab .lamp{width:9px; height:9px; border-radius:50%; background:var(--muted); flex:none}
+  .fab .lamp.ok{background:var(--ok)}
+  .fab .lamp.ng{background:var(--ng)}
+
+  /* ---- 音チェックのシート ---- */
+  .sheet-wrap{position:fixed; inset:0; z-index:60; display:none}
+  .sheet-wrap.open{display:block}
+  .scrim{position:absolute; inset:0; background:rgba(0,0,0,.6)}
+  .sheet{
+    position:absolute; left:0; right:0; bottom:0; max-height:88vh; overflow-y:auto;
+    background:#101015; border-radius:20px 20px 0 0; border-top:1px solid var(--line);
+    padding:14px 16px calc(20px + env(safe-area-inset-bottom));
+    -webkit-overflow-scrolling:touch; animation:up .2s ease;
+  }
+  @keyframes up{from{transform:translateY(14px);opacity:.6}to{transform:none;opacity:1}}
+  .handle{width:38px; height:4px; background:var(--line); border-radius:999px; margin:0 auto 12px}
+  .sheet h2{font-size:17px; margin:0 0 4px}
+  .sheet .lead{font-size:12.5px; color:var(--ink-2); line-height:1.75; margin:0}
+  .card{background:var(--surface); border:1px solid var(--line); border-radius:14px; padding:13px 14px; margin-top:12px}
+  .card>b{font-size:13.5px; display:block}
+  .card .sub{font-size:11.5px; color:var(--muted); line-height:1.7; margin:5px 0 0}
+
+  .steps{margin:8px 0 0; padding-left:1.25em; font-size:12.5px; line-height:2; color:var(--ink-2)}
+  .steps b{color:var(--ink)}
+
+  .rows{margin-top:8px; font-size:12.5px}
+  .rows div{display:flex; justify-content:space-between; gap:12px; padding:6px 0; border-top:1px solid var(--line)}
+  .rows div:first-child{border-top:0}
+  .rows span:first-child{color:var(--muted); flex:none}
+  .rows span:last-child{text-align:right; word-break:break-all; font-weight:600}
+  .rows .good{color:var(--ok)}
+  .rows .bad{color:var(--ng)}
+
+  .sw{display:flex; align-items:center; justify-content:space-between; gap:12px; margin-top:10px}
+  .sw .t{font-size:12.5px; line-height:1.6}
+  .sw .t small{display:block; color:var(--muted); font-size:11px; margin-top:2px}
+  .toggle{
+    flex:none; width:54px; height:31px; border-radius:999px; border:0; padding:0; cursor:pointer;
+    background:var(--surface-2); position:relative; transition:background .15s;
+  }
+  .toggle[aria-pressed="true"]{background:var(--ok)}
+  .toggle::after{
+    content:""; position:absolute; top:3px; left:3px; width:25px; height:25px; border-radius:50%;
+    background:#fff; transition:transform .15s;
+  }
+  .toggle[aria-pressed="true"]::after{transform:translateX(23px)}
+
+  .btn{
+    display:block; width:100%; margin-top:10px; padding:12px; border-radius:12px; cursor:pointer;
+    border:1px solid var(--line); background:var(--surface-2); color:var(--ink);
+    font-size:14px; font-weight:700; font-family:inherit;
+  }
+  .btn.primary{background:var(--accent); color:#000; border-color:transparent}
+  .btn.row{display:inline-block; width:auto; margin-right:8px; padding:10px 14px; font-size:13px}
+
+  .log{
+    margin-top:8px; background:#0a0a0e; border:1px solid var(--line); border-radius:10px;
+    padding:9px 10px; font-size:11px; line-height:1.85; max-height:190px; overflow-y:auto;
+    font-variant-numeric:tabular-nums; white-space:pre-wrap; word-break:break-all; color:var(--ink-2);
+  }
+  .log:empty::before{content:"まだ記録がありません"; color:var(--muted)}
+  .log .hi{color:var(--accent)}
+
+  .toast{
+    position:fixed; left:50%; bottom:calc(26px + env(safe-area-inset-bottom)); transform:translateX(-50%);
+    background:rgba(0,0,0,.86); border:1px solid var(--line); color:#fff; padding:10px 16px;
+    border-radius:999px; font-size:13px; z-index:200; opacity:0; pointer-events:none; transition:opacity .2s;
+  }
+  .toast.show{opacity:1}
+
+  @media (min-width:700px){
+    .sheet{left:50%; top:50%; bottom:auto; transform:translate(-50%,-50%);
+      width:min(620px,calc(100% - 56px)); border-radius:20px; border:1px solid var(--line); animation:none}
+    .handle{display:none}
+  }
+</style>
+</head>
+<body>
+
+<silent-camera autostart fullscreen facing="environment"></silent-camera>
+
+<div id="boot"><div class="c"><h1>🔇 しずかカメラ</h1><p>読み込み中…</p></div></div>
+
+<button class="fab" id="fab" type="button">
+  <span class="lamp" id="lamp"></span>🎵 音チェック
+</button>
+
+<div class="sheet-wrap" id="sheet">
+  <div class="scrim" data-close></div>
+  <div class="sheet">
+    <div class="handle"></div>
+    <h2>🎵 音チェック</h2>
+    <p class="lead">このカメラは<b>シャッター音が鳴らず</b>、聴いている<b>音楽も止めない</b>のが売りです。
+      本当に止まらないか、ここで確かめられます。</p>
+
+    <div class="card">
+      <b>確かめかた</b>
+      <ol class="steps">
+        <li>ミュージックなどで<b>音楽を流す</b></li>
+        <li>このアプリに戻って<b>「カメラを止める→入れる」</b>を押す</li>
+        <li>音楽が止まらなければ <b>合格</b></li>
+      </ol>
+      <button class="btn primary" id="cycle">カメラを止める → 入れる</button>
+      <p class="sub">この操作が、ふだん「カメラを開いた瞬間」に起きていることと同じです。</p>
+    </div>
+
+    <div class="card">
+      <b>いまの状態</b>
+      <div class="rows" id="rows"></div>
+      <p class="sub" id="verdict">—</p>
+    </div>
+
+    <div class="card">
+      <b>宣言のあり／なしを比べる</b>
+      <div class="sw">
+        <div class="t">他の音と混ざってよい、と宣言する
+          <small>iOS への「このページは音を出しません」という申告。切ると昔の動きに戻ります</small>
+        </div>
+        <button class="toggle" id="claim" type="button" aria-pressed="true" aria-label="宣言する"></button>
+      </div>
+      <p class="sub">切った状態で音楽が止まり、入れた状態で止まらなければ、<b>この宣言が効いている</b>ということです。
+        切り替えると、カメラを入れ直します。</p>
+    </div>
+
+    <div class="card">
+      <b>記録</b>
+      <p class="sub">カメラの入り切りと、音まわりの変化を時刻つきで残します。
+        音楽が止まった瞬間の行を見れば、何が引き金かが分かります。</p>
+      <div class="log" id="log"></div>
+      <button class="btn" id="copy">この内容をコピーする</button>
+      <button class="btn" id="clear">記録を消す</button>
+    </div>
+
+    <button class="btn" data-close style="margin-top:14px">とじる</button>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script src="silent-camera.js"></script>
+<script>
+"use strict";
+
+const $ = (s) => document.querySelector(s);
+const cam = $('silent-camera');
+
+/* ---------- 起動オーバーレイ ---------- */
+{
+  const boot = $('#boot');
+  const hide = () => boot && boot.classList.add('gone');
+  cam.addEventListener('ready', hide);
+  cam.addEventListener('error', hide);
+  setTimeout(hide, 1400);
+}
+
+/* ---------- 小道具 ---------- */
+let toastTimer = null;
+function toast(msg){
+  const t = $('#toast');
+  t.textContent = msg; t.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove('show'), 1800);
+}
+const two = (n) => String(n).padStart(2, '0');
+function clock(){
+  const d = new Date();
+  return `${two(d.getHours())}:${two(d.getMinutes())}:${two(d.getSeconds())}`;
+}
+
+/* ---------- 記録 ---------- */
+const lines = [];
+function log(msg, hi){
+  lines.push({ t: clock(), msg, hi });
+  if (lines.length > 200) lines.shift();
+  renderLog();
+}
+function renderLog(){
+  $('#log').innerHTML = lines
+    .map(l => `<div${l.hi ? ' class="hi"' : ''}>${l.t}  ${escapeHTML(l.msg)}</div>`)
+    .join('');
+  const box = $('#log');
+  box.scrollTop = box.scrollHeight;
+}
+function escapeHTML(s){
+  return String(s).replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+}
+
+/* ---------- 音まわりの状態 ----------
+   iOS は「そのページが音をどう使うか」で端末の音の設定を切り替える。
+   何も申告しないと自動判定になり、カメラを起こしたときに
+   録音向け／再生向け（どちらも他の音を止める設定）に変わることがある。
+   silent-camera は、カメラ中だけ ambient（他の音と混ざってよい）を申告する。 */
+function session(){
+  try { return navigator.audioSession || null; } catch (e) { return null; }
+}
+function iosVersion(){
+  const m = navigator.userAgent.match(/OS (\d+)[._](\d+)/);
+  return m ? `${m[1]}.${m[2]}` : '不明';
+}
+function browserName(){
+  const ua = navigator.userAgent;
+  // iOS 版は中身が Safari なので、名乗り（CriOS など）を先に見る
+  if (/CriOS/.test(ua)) return 'Chrome';
+  if (/EdgiOS/.test(ua)) return 'Edge';
+  if (/FxiOS/.test(ua)) return 'Firefox';
+  if (/OPiOS|OPR\//.test(ua)) return 'Opera';
+  if (/Edg\//.test(ua)) return 'Edge';
+  if (/Chrome\//.test(ua)) return 'Chrome';
+  if (/Safari\//.test(ua)) return 'Safari';
+  return 'その他';
+}
+const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent)
+  || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
+function snapshot(){
+  const s = session();
+  const info = cam.audioInfo || {};
+  return {
+    supported: !!s,
+    type: s ? s.type : null,
+    state: s ? s.state : null,
+    claimed: !!info.claimed,
+    running: cam.isRunning,
+    audioTracks: info.audioTracks ?? 0,
+    muted: info.videoMuted,
+    standalone: !!(window.navigator.standalone || matchMedia('(display-mode: standalone)').matches),
+  };
+}
+
+function renderRows(){
+  const s = snapshot();
+  const yn = (v) => v ? '<span class="good">はい</span>' : '<span class="bad">いいえ</span>';
+  const rows = [
+    ['カメラ', s.running ? '<span class="good">入っている</span>' : '止まっている'],
+    ['宣言の仕組み', s.supported ? '<span class="good">使える</span>' : '<span class="bad">この端末には無い</span>'],
+    ['いまの申告', escapeHTML(String(s.type ?? '—'))],
+    ['音の状態', escapeHTML(String(s.state ?? '—'))],
+    ['宣言できたか', s.supported ? yn(s.claimed || s.type === 'ambient') : '—'],
+    ['マイク（音声トラック）', s.audioTracks === 0 ? '<span class="good">0本</span>' : `<span class="bad">${s.audioTracks}本</span>`],
+    ['プレビューは無音か', yn(s.muted === true)],
+    ['ブラウザ', escapeHTML(browserName() + (isIOS ? '（iPadOS ' + iosVersion() + '）' : ''))],
+    ['ホーム画面から起動', yn(s.standalone)],
+  ];
+  $('#rows').innerHTML = rows.map(([k, v]) => `<div><span>${k}</span><span>${v}</span></div>`).join('');
+
+  const lamp = $('#lamp');
+  lamp.className = 'lamp' + (!s.supported ? ' ng' : (s.claimed || s.type === 'ambient') ? ' ok' : '');
+
+  $('#verdict').innerHTML = !s.supported
+    ? 'この端末のブラウザは、まだ<b>音の使い方を申告する仕組み</b>に対応していません。'
+      + '<b>iPadOS を新しくすると使えるようになることがあります。</b>'
+      + 'それでも、マイクを一切使わず・プレビューを無音にしているので、止まらない端末も多いです。'
+    : (s.claimed || s.type === 'ambient')
+      ? '<b>申告できています。</b>この状態で音楽が止まるなら、'
+        + 'ブラウザ側の作りの問題です。下の記録を残しておいてください。'
+      : 'カメラが止まっているあいだは申告しません。'
+        + '<b>カメラを入れると</b>「ambient」に変わります。';
+}
+
+/* 音の状態が変わったら記録する（＝他のアプリの音が止まる瞬間） */
+{
+  const s = session();
+  if (s && s.addEventListener){
+    s.addEventListener('statechange', () => {
+      log(`音の状態が「${s.state}」になりました`, s.state === 'interrupted');
+      renderRows();
+    });
+  }
+}
+
+/* ---------- カメラの入り切り ---------- */
+cam.addEventListener('ready', () => { log('カメラが入りました（申告：' + String(snapshot().type) + '）'); renderRows(); });
+cam.addEventListener('error', (e) => { log('カメラのエラー：' + (e.detail && e.detail.title || '')); renderRows(); });
+cam.addEventListener('capture', (e) => { log(`撮影 ${e.detail.width}×${e.detail.height}`); });
+
+async function cycleCamera(){
+  const b = $('#cycle');
+  b.disabled = true;
+  log('— カメラを止めます —', true);
+  cam.stop();
+  renderRows();
+  await new Promise(r => setTimeout(r, 900));
+  log('— カメラを入れます —', true);
+  try { await cam.start(); } catch (e) { /* エラーは error イベントで拾う */ }
+  renderRows();
+  b.disabled = false;
+}
+
+/* ---------- 申告のあり／なし ---------- */
+function setClaim(on){
+  $('#claim').setAttribute('aria-pressed', String(on));
+  if (on) cam.removeAttribute('no-audio-claim');
+  else cam.setAttribute('no-audio-claim', '');
+  try { localStorage.setItem('quietcam.claim', on ? '1' : '0'); } catch (e) {}
+  log(on ? '申告を「する」にしました' : '申告を「しない」にしました', true);
+}
+
+/* ---------- 配線 ---------- */
+$('#fab').onclick = () => { renderRows(); $('#sheet').classList.add('open'); };
+document.querySelectorAll('[data-close]').forEach(el => el.onclick = () => $('#sheet').classList.remove('open'));
+$('#cycle').onclick = cycleCamera;
+$('#claim').onclick = async () => {
+  const next = $('#claim').getAttribute('aria-pressed') !== 'true';
+  setClaim(next);
+  await cycleCamera();
+};
+$('#clear').onclick = () => { lines.length = 0; renderLog(); };
+$('#copy').onclick = async () => {
+  const s = snapshot();
+  const text = [
+    '【しずかカメラ 音チェック】',
+    `ブラウザ: ${browserName()}${isIOS ? ' / iPadOS ' + iosVersion() : ''}`,
+    `ホーム画面から起動: ${s.standalone ? 'はい' : 'いいえ'}`,
+    `宣言の仕組み: ${s.supported ? 'あり' : 'なし'} / 申告: ${s.type} / 状態: ${s.state}`,
+    `宣言できたか: ${s.claimed ? 'はい' : 'いいえ'} / 音声トラック: ${s.audioTracks}本 / 無音: ${s.muted}`,
+    navigator.userAgent,
+    '--- 記録 ---',
+    ...lines.map(l => `${l.t}  ${l.msg}`),
+  ].join('\n');
+  try {
+    await navigator.clipboard.writeText(text);
+    toast('コピーしました');
+  } catch (e) {
+    // クリップボードが使えないときは選択できる形で出す
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.cssText = 'position:fixed;left:8px;right:8px;bottom:80px;height:36vh;z-index:300;font-size:12px';
+    document.body.appendChild(ta);
+    ta.select();
+    toast('長おしでコピーしてください');
+    setTimeout(() => ta.remove(), 20000);
+  }
+};
+
+/* ---------- 起動時 ---------- */
+try {
+  if (localStorage.getItem('quietcam.claim') === '0'){
+    $('#claim').setAttribute('aria-pressed', 'false');
+    cam.setAttribute('no-audio-claim', '');
+  }
+} catch (e) {}
+log('アプリを開きました');
+renderRows();
+setInterval(renderRows, 1500);   // 申告や状態は外の都合でも変わるので、見えている値を追いかける
+
+/* iPad のダブルタップ拡大とピンチ拡大を抑止（プレビュー操作を優先） */
+document.addEventListener('gesturestart', e => e.preventDefault());
+let lastTap = 0;
+document.addEventListener('touchend', e => {
+  if (e.target.closest('.sheet')) return;      // シートの中は普通に触れるように
+  const now = Date.now();
+  if (now - lastTap < 320) e.preventDefault();
+  lastTap = now;
+}, { passive: false });
+
+/* オフラインで使えるように */
+if ('serviceWorker' in navigator && location.protocol === 'https:') {
+  window.addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch(() => {}));
+}
+if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
+</script>
+</body>
+</html>
