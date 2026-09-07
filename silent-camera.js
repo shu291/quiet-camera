@@ -64,6 +64,8 @@
 
   const pad = (n) => String(n).padStart(2, '0');
 
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
   function stamp(d) {
     return (
       d.getFullYear() +
@@ -477,8 +479,27 @@ input[type=range]{accent-color:var(--accent);}
       this.selMode = false;
       this.viewIndex = -1;
       this.busy = false;
+
+      // ---- 復帰まわりの状態 ----
+      this._wantRunning = false;  // 「いまカメラが点いているべきか」。裏に回っても消えない
+      this._failed = false;       // 起動に失敗して案内を出している最中か
+      this._lastErrorName = '';
+      this._chain = null;         // start / resume を一列に並べる（二重起動よけ）
+      this._q = 0;                // 順番待ちの数
+      this._frames = 0;           // 実際に絵が届いた回数
+      this._rvfc = null;
+      this._rvfcOK = false;
+      this._mark = null;          // 前回の見張りで見た進み具合
+      this._strikes = 0;
+      this._resumeTimer = null;
+      this._watchTimer = null;
+
       this._onResize = () => this.layout();
       this._onVis = () => this.handleVisibility();
+      // ホーム画面から戻ったときの合図は端末ごとに違う。どれか一つ効けばよい
+      this._onWake = () => { if (!document.hidden) this._resumeSoon(120); };
+      this._onHide = () => this._teardown();
+      this._onTick = () => this._check();
     }
 
     /* ---------- ライフサイクル ---------- */
@@ -509,6 +530,14 @@ input[type=range]{accent-color:var(--accent);}
       window.addEventListener('resize', this._onResize);
       window.addEventListener('orientationchange', this._onResize);
       document.addEventListener('visibilitychange', this._onVis);
+      // 「ホームに戻って、もう一度開く」で visibilitychange が来ない端末がある。
+      // 復帰の合図を広めに拾い、どれか一つでも効けばよいことにする。
+      window.addEventListener('pageshow', this._onWake);
+      window.addEventListener('focus', this._onWake);
+      document.addEventListener('resume', this._onWake);
+      window.addEventListener('pagehide', this._onHide);
+      // それでも取りこぼしたときのための見張り（映像が止まったら起こし直す）
+      this._watchTimer = setInterval(this._onTick, 1000);
 
       if (this.hasAttribute('autostart')) {
         // iOS では起動にユーザー操作が要る場合があるので、失敗したら案内を出す
@@ -522,6 +551,13 @@ input[type=range]{accent-color:var(--accent);}
       window.removeEventListener('resize', this._onResize);
       window.removeEventListener('orientationchange', this._onResize);
       document.removeEventListener('visibilitychange', this._onVis);
+      window.removeEventListener('pageshow', this._onWake);
+      window.removeEventListener('focus', this._onWake);
+      document.removeEventListener('resume', this._onWake);
+      window.removeEventListener('pagehide', this._onHide);
+      clearInterval(this._watchTimer);
+      clearTimeout(this._resumeTimer);
+      this._watchTimer = null;
       this.stop();
       this.urls.forEach((u) => URL.revokeObjectURL(u));
       this.urls.clear();
@@ -657,12 +693,69 @@ input[type=range]{accent-color:var(--accent);}
       this.el.video.addEventListener('loadedmetadata', () => {
         this.layout();
         this.updateInfo();
+        // 自動再生が弾かれていたら、寸法が分かった時点でもう一度流す
+        if (this._shouldRun() && this.el.video.paused) this.el.video.play().catch(() => {});
+      });
+
+      // 端末の都合で勝手に止まったら起こし直す（復帰直後の iOS がこれをやる）
+      this.el.video.addEventListener('pause', () => {
+        if (this._shouldRun() && this.isRunning) this._resumeSoon(200);
       });
     }
 
     /* ---------- カメラ制御 ---------- */
 
-    async start() {
+    /* start / resume は必ず一列に並べて実行する。
+       iOS はカメラを二重に起こすと、どちらの映像も出なくなることがある
+       （＝復帰の自動起動とシャッターの手動起動がぶつかって真っ黒のまま固まる）。 */
+    _enqueue(fn) {
+      this._q++;
+      const run = () => fn();
+      const next = (this._chain || Promise.resolve()).then(run, run);
+      const settle = () => { this._q--; };
+      this._chain = next.then(settle, settle);
+      return next;
+    }
+
+    start() {
+      this._wantRunning = true;
+      this._failed = false;
+      return this._enqueue(() => this._startOnce());
+    }
+
+    /* 復帰（ホーム画面から戻ってきた等）。
+       映像が生きていれば流し直すだけ、死んでいれば取り直す。 */
+    resume() {
+      if (!this._wantRunning) return Promise.resolve(false);
+      // 許可が無い／カメラが無いのは自動では直らない。案内のボタンを押してもらう
+      if (this._lastErrorName === 'NotAllowedError' || this._lastErrorName === 'NotFoundError') {
+        return Promise.resolve(false);
+      }
+      this._failed = false;
+      return this._enqueue(async () => {
+        if (!this._shouldRun()) return false;
+        if (this.isRunning && this.el.video.srcObject && (await this._playAndVerify())) return true;
+
+        // 戻ってきた直後は、端末がまだカメラを手放していないことがある。少し待って何度か試す
+        for (let i = 0; i < 3; i++) {
+          if (!this._shouldRun()) return false;
+          if (await this._startOnce()) return true;
+          const n = this._lastErrorName;
+          if (n === 'NotAllowedError' || n === 'NotFoundError') return false; // 待っても直らない
+          if (i < 2) await wait(400 * (i + 1));
+        }
+        // 裏に回っただけなら失敗扱いにしない（次に戻ってきたときにまた試す）
+        if (this._shouldRun()) {
+          this.fail(
+            'カメラが応答しませんでした',
+            '下の「カメラを起動」を押すと、もう一度つなぎ直します。'
+          );
+        }
+        return false;
+      });
+    }
+
+    async _startOnce() {
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
         return this.fail(
           'このブラウザではカメラを使えません',
@@ -676,7 +769,8 @@ input[type=range]{accent-color:var(--accent);}
         );
       }
 
-      this.stop();
+      this._teardown();
+      this._lastErrorName = '';
       // カメラを起こす前に宣言する。起こしたあとでは、
       // すでに切り替わった設定を追いかけることになる。
       // no-audio-claim を付けると宣言しない（宣言のあり／なしを比べたいとき用）
@@ -703,6 +797,8 @@ input[type=range]{accent-color:var(--accent);}
             stream = await attempt(true);
           } catch (err3) {
             const name = err3 && err3.name;
+            // 何でこけたかを覚えておく。復帰のときに「待てば直る種類か」を見分ける
+            this._lastErrorName = name || '';
             // 音の宣言（ambient）がカメラの邪魔をする端末があるかもしれないので、
             // 許可以外の理由でこけたら宣言を取り下げて一度だけやり直す。
             // カメラが写らないより、音楽が止まるほうがまだましなので。
@@ -725,8 +821,20 @@ input[type=range]{accent-color:var(--accent);}
         }
       }
 
+      // 取っているあいだに裏へ回った／止められたなら、そのまま手放す。
+      // ここで繋いでしまうと、裏でカメラを握ったまま（＝音楽が止まったまま）になる
+      if (document.hidden || !this._wantRunning) {
+        stream.getTracks().forEach((t) => t.stop());
+        releaseAmbient(this._prevAudioType);
+        this._ambient = false;
+        return false;
+      }
+
       this.stream = stream;
       this.track = stream.getVideoTracks()[0];
+      this._lastErrorName = '';
+      this._failed = false;
+      this._bindTrack();
       // 万一オーディオトラックが混ざっても即座に破棄（無音の保険）
       stream.getAudioTracks().forEach((t) => {
         t.stop();
@@ -743,6 +851,7 @@ input[type=range]{accent-color:var(--accent);}
       } catch (e) {
         /* 自動再生が弾かれても loadedmetadata 後に再試行される */
       }
+      this._watchFrames();
 
       this.el.perm.classList.remove('open');
       this.applySettings();
@@ -752,7 +861,17 @@ input[type=range]{accent-color:var(--accent);}
       return true;
     }
 
+    /* 明示的に止める（外から呼ぶ用）。もう点けなくてよい、という意思表示なので
+       裏に回ったときの自動復帰の対象からも外れる。 */
     stop() {
+      this._wantRunning = false;
+      this._teardown();
+    }
+
+    /* 映像だけ落とす。「また点けるつもり」は _wantRunning に残す。
+       裏に回ったときはこちらを使う（stop() だと戻ってきても復帰しなくなる）。 */
+    _teardown() {
+      this._unwatchFrames();
       if (this.stream) {
         this.stream.getTracks().forEach((t) => t.stop());
         this.stream = null;
@@ -768,6 +887,8 @@ input[type=range]{accent-color:var(--accent);}
       }
       releaseAmbient(this._prevAudioType);
       this._ambient = false;
+      this._mark = null;
+      this._strikes = 0;
     }
 
     /* いま映像が流れているか。組み込み先が「すでに動いていれば取り直さない」を
@@ -797,14 +918,110 @@ input[type=range]{accent-color:var(--accent);}
 
     handleVisibility() {
       if (document.hidden) {
-        this._wasRunning = !!this.stream;
-        this.stop();
-      } else if (this._wasRunning) {
-        this._wasRunning = false;
-        // 画面に出ていないなら起こし直さない。組み込み先で隠されているときに
-        // 勝手に復帰すると、再生中の音楽をもう一度止めてしまう
-        if (this.offsetParent === null) return;
-        this.start().catch(() => this.showPerm());
+        // 裏に回ったらカメラは離す（プライバシー表示と、他アプリの音のため）。
+        // 「また点ける」意思は _wantRunning に残るので、hidden が続けて2回来ても消えない。
+        this._teardown();
+      } else {
+        // 戻ってきた直後は端末がまだカメラを握っていることがあるので、少しだけ待つ
+        this._resumeSoon(120);
+      }
+    }
+
+    _resumeSoon(ms) {
+      clearTimeout(this._resumeTimer);
+      this._resumeTimer = setTimeout(() => {
+        this._resumeTimer = null;
+        this.resume().catch(() => {});
+      }, ms);
+    }
+
+    /* いま点いているべきか */
+    _shouldRun() {
+      return this._wantRunning && !document.hidden && this.isDisplayed();
+    }
+
+    /* 画面に出ているか。
+       ここを offsetParent で判定してはいけない。position:fixed の要素は
+       offsetParent が常に null なので（このアプリの <silent-camera> がまさにそれ）、
+       「戻ってきても永久に復帰しない」になる。 */
+    isDisplayed() {
+      if (!this.isConnected) return false;
+      if (typeof this.checkVisibility === 'function') {
+        try { return this.checkVisibility(); } catch (e) { /* 下の寸法で判定する */ }
+      }
+      const r = this.getBoundingClientRect();
+      return r.width > 0 && r.height > 0;
+    }
+
+    /* 映像が本当に流れているか（絵が進んでいるか）を見る目盛り。
+       requestVideoFrameCallback が効く端末では届いたコマ数、
+       無ければ再生位置で代用する。 */
+    _progress() {
+      const v = this.el && this.el.video;
+      if (!v) return 0;
+      return this._rvfcOK ? this._frames : v.currentTime;
+    }
+
+    _watchFrames() {
+      const v = this.el.video;
+      if (!v.requestVideoFrameCallback || this._rvfc != null) return;
+      const tick = () => {
+        this._frames++;
+        this._rvfcOK = true;
+        if (this._rvfc != null) this._rvfc = v.requestVideoFrameCallback(tick);
+      };
+      this._rvfc = v.requestVideoFrameCallback(tick);
+    }
+
+    _unwatchFrames() {
+      const v = this.el && this.el.video;
+      if (v && v.cancelVideoFrameCallback && this._rvfc != null) {
+        try { v.cancelVideoFrameCallback(this._rvfc); } catch (e) { /* もう無効なら放っておく */ }
+      }
+      this._rvfc = null;
+    }
+
+    /* トラックは生きているのに絵が止まっていることがある（復帰直後の iOS）。
+       まず流し直してみて、それでも進まなければ取り直す合図を返す。 */
+    async _playAndVerify() {
+      const v = this.el.video;
+      this._watchFrames();
+      try { await v.play(); } catch (e) { /* 進まなければ下で false になる */ }
+      const before = this._progress();
+      await wait(700);
+      return this.isRunning && !v.paused && this._progress() !== before;
+    }
+
+    /* トラック側からの合図。iOS は裏に回るとトラックを黙らせたり終わらせたりする */
+    _bindTrack() {
+      const t = this.track;
+      if (!t || !t.addEventListener) return;
+      t.addEventListener('ended', () => { if (this._shouldRun()) this._resumeSoon(200); });
+      t.addEventListener('mute', () => { if (this._shouldRun()) this._resumeSoon(800); });
+    }
+
+    /* 見張り。合図を取りこぼしても、映像が止まっていれば気づいて起こし直す。
+       2回続けて止まって見えたときだけ動く（一瞬のもたつきで再起動しないため）。 */
+    _check() {
+      if (this._q || this.busy || this._failed || !this._shouldRun()) {
+        this._mark = null;
+        this._strikes = 0;
+        return;
+      }
+      const v = this.el.video;
+      const alive = this.isRunning && !!v.srcObject && !v.paused && !v.ended;
+      const now = this._progress();
+      const frozen = alive && this._mark !== null && now === this._mark;
+      this._mark = now;
+      if (!alive || frozen) {
+        this._strikes++;
+        if (this._strikes >= 2) {
+          this._strikes = 0;
+          this._mark = null;
+          this.resume().catch(() => {});
+        }
+      } else {
+        this._strikes = 0;
       }
     }
 
@@ -813,6 +1030,9 @@ input[type=range]{accent-color:var(--accent);}
     }
 
     fail(title, msg) {
+      // 案内を出しているあいだは見張りを黙らせる（延々と起動を試し続けないため）。
+      // 次に画面へ戻ってきたときや、ボタンを押したときにまた試す。
+      this._failed = true;
       this.el.pt.textContent = title;
       this.el.pm.textContent = msg;
       this.el.perm.classList.add('open');
@@ -893,7 +1113,32 @@ input[type=range]{accent-color:var(--accent);}
 
     async shoot() {
       if (this.busy) return;
-      if (!this.stream) return this.start();
+
+      // 復帰直後は映像が死んでいることがある。ここで起こし直してから撮る。
+      // （以前は無反応のまま、あるいは止まったコマを撮っていた）
+      const v = this.el.video;
+      const needsWake = !this.isRunning || !v.srcObject || v.paused;
+      if (needsWake || !v.videoWidth) {
+        this.busy = true;
+        this.el.shot.disabled = true;
+        try {
+          if (needsWake) {
+            this.toast('カメラを起こしています…');
+            let ok = await this.resume();
+            if (!ok && !this._wantRunning) ok = await this.start();
+            if (!ok) return;             // 起こせなかったときは案内が出ている
+          }
+          // 絵が1コマも届く前に撮ると黙って空振りするので、届くまで待つ
+          await this._waitFrames(1500);
+        } catch (e) {
+          return;
+        } finally {
+          this.busy = false;
+          this.el.shot.disabled = false;
+        }
+        if (!this.isRunning || !v.videoWidth) return this.toast('カメラの準備中です');
+      }
+
       this.busy = true;
       this.el.shot.disabled = true;
       try {
@@ -921,6 +1166,19 @@ input[type=range]{accent-color:var(--accent);}
         this.el.shot.disabled = false;
         this.el.shotN.textContent = '';
       }
+    }
+
+    /* 起こし直した直後の1枚が真っ黒／前のコマ、にならないように
+       絵が届いて露出が落ち着くまで少しだけ待つ */
+    async _waitFrames(ms) {
+      const v = this.el.video;
+      const before = this._progress();
+      const t0 = Date.now();
+      while (Date.now() - t0 < ms) {
+        if (v.videoWidth && this._progress() !== before) break;
+        await wait(60);
+      }
+      await wait(250);
     }
 
     countdown(sec) {
