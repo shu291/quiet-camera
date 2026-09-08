@@ -394,7 +394,11 @@ setInterval(renderRows, 1500);   // 申告や状態は外の都合でも変わ�
 document.addEventListener('gesturestart', e => e.preventDefault());
 let lastTap = 0;
 document.addEventListener('touchend', e => {
-  if (e.target.closest('.sheet')) return;      // シートの中は普通に触れるように
+  // シートの中と、カメラ本体は普通に触れるように。
+  // ここで preventDefault すると、続けて押したタップの click が消えてしまう
+  // （＝シャッターを連続で押すと反応しない）。カメラ側は touch-action:manipulation
+  // で拡大を止めているので、ここで抑える必要はない。
+  if (e.target.closest('.sheet, silent-camera')) return;
   const now = Date.now();
   if (now - lastTap < 320) e.preventDefault();
   lastTap = now;

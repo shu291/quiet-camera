@@ -1,5 +1,5 @@
 /* しずかカメラ — オフライン用 Service Worker */
-const CACHE = 'quiet-camera-v1';
+const CACHE = 'quiet-camera-v2';
 const ASSETS = [
   './',
   './index.html',
